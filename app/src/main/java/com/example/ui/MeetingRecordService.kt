@@ -7,12 +7,17 @@ import android.app.PendingIntent
 import android.app.Service
 import android.content.Context
 import android.content.Intent
+import android.media.AudioFormat
+import android.media.AudioRecord
 import android.media.MediaRecorder
 import android.os.Build
 import android.os.IBinder
-import android.os.SystemClock
+import android.os.PowerManager
 import android.util.Log
 import androidx.core.app.NotificationCompat
+import com.example.data.database.AppDatabase
+import com.example.data.database.MeetingAudioSegment
+import com.example.data.repository.TranslationRepository
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -21,8 +26,8 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
 import java.io.File
-import java.text.SimpleDateFormat
-import java.util.Date
+import java.io.FileOutputStream
+import java.io.RandomAccessFile
 import java.util.Locale
 
 private const val TAG = "MeetingRecordService"
@@ -31,10 +36,18 @@ private const val NOTIFICATION_ID = 2026
 
 class MeetingRecordService : Service() {
 
-    private var mediaRecorder: MediaRecorder? = null
+    private var audioRecord: AudioRecord? = null
+    private var recordingThread: Thread? = null
+    private var isRecordingAudio = false
+    
+    private val sampleRate = 16000
+    private val channelConfig = AudioFormat.CHANNEL_IN_MONO
+    private val audioFormat = AudioFormat.ENCODING_PCM_16BIT
+    private val chunkDurationSec = 30 // Tự động chia nhỏ file mỗi 30 giây
+
     private var serviceJob: Job? = null
     private val serviceScope = CoroutineScope(Dispatchers.Main)
-    private var wakeLock: android.os.PowerManager.WakeLock? = null
+    private var wakeLock: PowerManager.WakeLock? = null
 
     private var segmentIndex = 0
     private var segmentDurationSec = 0
@@ -117,9 +130,8 @@ class MeetingRecordService : Service() {
         if (_isRecording.value) return
 
         try {
-            // Acquire WakeLock to keep CPU alive during screen off
-            val powerManager = getSystemService(Context.POWER_SERVICE) as android.os.PowerManager
-            wakeLock = powerManager.newWakeLock(android.os.PowerManager.PARTIAL_WAKE_LOCK, "MeetingRecord::WakeLock").apply {
+            val powerManager = getSystemService(Context.POWER_SERVICE) as PowerManager
+            wakeLock = powerManager.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "MeetingRecord::WakeLock").apply {
                 acquire()
             }
 
@@ -129,31 +141,13 @@ class MeetingRecordService : Service() {
             _meetingSessionId.value = sessionId
             _outputFilePath.value = null
 
-            val cacheDir = externalCacheDir ?: cacheDir
-            val outputFile = File(cacheDir, "${sessionId}_part_${segmentIndex}.m4a")
-            currentSegmentFile = outputFile
-
-            mediaRecorder = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-                MediaRecorder(this)
-            } else {
-                @Suppress("DEPRECATION")
-                MediaRecorder()
-            }.apply {
-                setAudioSource(MediaRecorder.AudioSource.MIC)
-                setOutputFormat(MediaRecorder.OutputFormat.MPEG_4)
-                setAudioEncoder(MediaRecorder.AudioEncoder.AAC)
-                setAudioSamplingRate(16000)
-                setAudioChannels(1)
-                setAudioEncodingBitRate(32000)
-                setOutputFile(outputFile.absolutePath)
-                prepare()
-                start()
-            }
-
             _isRecording.value = true
             _isPaused.value = false
             _durationSec.value = 0
             InterpreterWidgetProvider.updateWidgetState(this)
+
+            // Start AudioRecord Background Thread
+            startAudioRecordingThread()
 
             // Start Foreground Service with type to comply with API 29+ / Android 14+
             val notification = createNotification(0)
@@ -180,7 +174,7 @@ class MeetingRecordService : Service() {
                     }
                 }
             }
-            Log.d(TAG, "Recording started segment $segmentIndex: ${outputFile.absolutePath}")
+            Log.d(TAG, "Recording started sessionId: $sessionId")
 
         } catch (e: Exception) {
             Log.e(TAG, "Failed to start recording", e)
@@ -194,97 +188,285 @@ class MeetingRecordService : Service() {
         }
     }
 
+    private fun startAudioRecordingThread() {
+        isRecordingAudio = true
+        recordingThread = Thread({
+            val bufferSize = AudioRecord.getMinBufferSize(sampleRate, channelConfig, audioFormat) * 2
+            val audioData = ShortArray(bufferSize / 2)
+
+            val meetingsDir = File(filesDir, "meetings")
+            if (!meetingsDir.exists()) {
+                meetingsDir.mkdirs()
+            }
+
+            var fos: FileOutputStream? = null
+            var totalWrittenBytes = 0L
+            var currentSegmentWrittenBytes = 0L
+            val bytesPerSecond = sampleRate * 2 // 16000 * 2 = 32000 bytes/s
+            val chunkBytesLimit = chunkDurationSec * bytesPerSecond
+
+            val db = AppDatabase.getDatabase(applicationContext)
+            val repository = TranslationRepository(db.translationDao())
+
+            try {
+                if (android.content.pm.PackageManager.PERMISSION_GRANTED == androidx.core.content.ContextCompat.checkSelfPermission(
+                        this, android.Manifest.permission.RECORD_AUDIO
+                    )) {
+                    audioRecord = AudioRecord(
+                        MediaRecorder.AudioSource.MIC,
+                        sampleRate,
+                        channelConfig,
+                        audioFormat,
+                        bufferSize
+                    )
+                } else {
+                    Log.e(TAG, "RECORD_AUDIO permission not granted")
+                    _isRecording.value = false
+                    stopSelf()
+                    return@Thread
+                }
+
+                audioRecord?.startRecording()
+
+                fun openNewSegmentFile() {
+                    val sessionId = _meetingSessionId.value ?: return
+                    val segmentFile = File(meetingsDir, "${sessionId}_part_${segmentIndex}.wav")
+                    currentSegmentFile = segmentFile
+                    currentSegmentWrittenBytes = 0
+
+                    fos = FileOutputStream(segmentFile)
+                    // Write dummy WAV header (44 bytes) to reserve space
+                    fos?.write(ByteArray(44))
+                    Log.d(TAG, "Opened new segment file: ${segmentFile.absolutePath}")
+                }
+
+                openNewSegmentFile()
+                var wasPausedLastFrame = false
+
+                while (isRecordingAudio) {
+                    val isPausedNow = _isPaused.value
+                    if (isPausedNow != wasPausedLastFrame) {
+                        if (isPausedNow) {
+                            // Finalize current segment WAV file when paused
+                            fos?.close()
+                            fos = null
+                            val finalizedFile = currentSegmentFile
+                            if (finalizedFile != null && finalizedFile.exists() && currentSegmentWrittenBytes > 0) {
+                                writeWavHeader(finalizedFile, currentSegmentWrittenBytes)
+                                val currentDuration = (currentSegmentWrittenBytes / bytesPerSecond).toInt().coerceAtLeast(1)
+                                val sessId = _meetingSessionId.value.orEmpty()
+                                val currentSegIndex = segmentIndex
+                                val segmentStartTime = (totalWrittenBytes - currentSegmentWrittenBytes) * 1000 / bytesPerSecond
+
+                                serviceScope.launch(Dispatchers.IO) {
+                                    repository.insertSegment(
+                                        MeetingAudioSegment(
+                                            sessionId = sessId,
+                                            segmentIndex = currentSegIndex,
+                                            filePath = finalizedFile.absolutePath,
+                                            startTimeMs = segmentStartTime,
+                                            durationSec = currentDuration,
+                                            status = "PENDING"
+                                        )
+                                    )
+                                    _latestSegment.value = SegmentInfo(sessId, finalizedFile.absolutePath, currentDuration)
+                                }
+                                segmentIndex++
+                            }
+                        } else {
+                            // Open new segment file when resumed
+                            openNewSegmentFile()
+                        }
+                        wasPausedLastFrame = isPausedNow
+                    }
+
+                    val readSize = audioRecord?.read(audioData, 0, audioData.size) ?: -1
+                    if (readSize > 0) {
+                        if (!isPausedNow) {
+                            // Convert ShortArray to ByteArray (Little-Endian)
+                            val byteBuffer = ByteArray(readSize * 2)
+                            for (i in 0 until readSize) {
+                                val value = audioData[i]
+                                byteBuffer[i * 2] = (value.toInt() and 0xff).toByte()
+                                byteBuffer[i * 2 + 1] = ((value.toInt() shr 8) and 0xff).toByte()
+                            }
+
+                            fos?.write(byteBuffer)
+                            currentSegmentWrittenBytes += byteBuffer.size
+                            totalWrittenBytes += byteBuffer.size
+
+                            // Check chunk limit
+                            if (currentSegmentWrittenBytes >= chunkBytesLimit) {
+                                fos?.close()
+                                fos = null
+                                val finalizedFile = currentSegmentFile
+                                val currentDuration = (currentSegmentWrittenBytes / bytesPerSecond).toInt()
+                                val sessId = _meetingSessionId.value.orEmpty()
+                                val currentSegIndex = segmentIndex
+
+                                if (finalizedFile != null && finalizedFile.exists()) {
+                                    writeWavHeader(finalizedFile, currentSegmentWrittenBytes)
+                                    val segmentStartTime = (totalWrittenBytes - currentSegmentWrittenBytes) * 1000 / bytesPerSecond
+                                    serviceScope.launch(Dispatchers.IO) {
+                                        repository.insertSegment(
+                                            MeetingAudioSegment(
+                                                sessionId = sessId,
+                                                segmentIndex = currentSegIndex,
+                                                filePath = finalizedFile.absolutePath,
+                                                startTimeMs = segmentStartTime,
+                                                durationSec = currentDuration,
+                                                status = "PENDING"
+                                            )
+                                        )
+                                        _latestSegment.value = SegmentInfo(sessId, finalizedFile.absolutePath, currentDuration)
+                                    }
+                                }
+
+                                segmentIndex++
+                                openNewSegmentFile()
+                            }
+                        }
+                    } else {
+                        Thread.sleep(10)
+                    }
+                }
+
+                // Finalize last segment on stop
+                fos?.close()
+                fos = null
+                val finalizedFile = currentSegmentFile
+                if (finalizedFile != null && finalizedFile.exists() && currentSegmentWrittenBytes > 0) {
+                    writeWavHeader(finalizedFile, currentSegmentWrittenBytes)
+                    val currentDuration = (currentSegmentWrittenBytes / bytesPerSecond).toInt().coerceAtLeast(1)
+                    val sessId = _meetingSessionId.value.orEmpty()
+                    val currentSegIndex = segmentIndex
+                    val segmentStartTime = (totalWrittenBytes - currentSegmentWrittenBytes) * 1000 / bytesPerSecond
+
+                    serviceScope.launch(Dispatchers.IO) {
+                        repository.insertSegment(
+                            MeetingAudioSegment(
+                                sessionId = sessId,
+                                segmentIndex = currentSegIndex,
+                                filePath = finalizedFile.absolutePath,
+                                startTimeMs = segmentStartTime,
+                                durationSec = currentDuration,
+                                status = "PENDING"
+                            )
+                        )
+                        _latestSegment.value = SegmentInfo(sessId, finalizedFile.absolutePath, currentDuration)
+                    }
+                }
+
+            } catch (e: Exception) {
+                Log.e(TAG, "Error in recording thread", e)
+            } finally {
+                try {
+                    audioRecord?.stop()
+                    audioRecord?.release()
+                } catch (ex: Exception) {
+                    Log.e(TAG, "Error releasing audioRecord", ex)
+                }
+                audioRecord = null
+                fos?.close()
+            }
+        }, "MeetingRecordThread")
+        recordingThread?.start()
+    }
+
+    private fun writeWavHeader(file: File, pcmDataLength: Long) {
+        val totalDataLen = pcmDataLength + 36
+        val channels = 1
+        val byteRate = sampleRate * channels * 2L
+
+        try {
+            RandomAccessFile(file, "rw").use { raf ->
+                raf.seek(0)
+                val header = ByteArray(44)
+                header[0] = 'R'.code.toByte() // RIFF
+                header[1] = 'I'.code.toByte()
+                header[2] = 'F'.code.toByte()
+                header[3] = 'F'.code.toByte()
+                header[4] = (totalDataLen and 0xff).toByte()
+                header[5] = ((totalDataLen shr 8) and 0xff).toByte()
+                header[6] = ((totalDataLen shr 16) and 0xff).toByte()
+                header[7] = ((totalDataLen shr 24) and 0xff).toByte()
+                header[8] = 'W'.code.toByte() // WAVE
+                header[9] = 'A'.code.toByte()
+                header[10] = 'V'.code.toByte()
+                header[11] = 'E'.code.toByte()
+                header[12] = 'f'.code.toByte() // fmt 
+                header[13] = 'm'.code.toByte()
+                header[14] = 't'.code.toByte()
+                header[15] = ' '.code.toByte()
+                header[16] = 16 // Subchunk1Size (16 for PCM)
+                header[17] = 0
+                header[18] = 0
+                header[19] = 0
+                header[20] = 1 // AudioFormat (1 for PCM)
+                header[21] = 0
+                header[22] = channels.toByte() // NumChannels (1 for mono)
+                header[23] = 0
+                header[24] = (sampleRate and 0xff).toByte() // SampleRate
+                header[25] = ((sampleRate shr 8) and 0xff).toByte()
+                header[26] = ((sampleRate shr 16) and 0xff).toByte()
+                header[27] = ((sampleRate shr 24) and 0xff).toByte()
+                header[28] = (byteRate and 0xff).toByte() // ByteRate
+                header[29] = ((byteRate shr 8) and 0xff).toByte()
+                header[30] = ((byteRate shr 16) and 0xff).toByte()
+                header[31] = ((byteRate shr 24) and 0xff).toByte()
+                header[32] = (channels * 2).toByte() // BlockAlign
+                header[33] = 0
+                header[34] = 16 // BitsPerSample
+                header[35] = 0
+                header[36] = 'd'.code.toByte() // data
+                header[37] = 'a'.code.toByte()
+                header[38] = 't'.code.toByte()
+                header[39] = 'a'.code.toByte()
+                header[40] = (pcmDataLength and 0xff).toByte() // Subchunk2Size
+                header[41] = ((pcmDataLength shr 8) and 0xff).toByte()
+                header[42] = ((pcmDataLength shr 16) and 0xff).toByte()
+                header[43] = ((pcmDataLength shr 24) and 0xff).toByte()
+
+                raf.write(header)
+                Log.d(TAG, "Wrote WAV header to ${file.name}, data size: $pcmDataLength")
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to write WAV header", e)
+        }
+    }
+
     private fun pauseRecording() {
         if (!_isRecording.value || _isPaused.value) return
-        try {
-            mediaRecorder?.apply {
-                stop()
-                release()
-            }
-            mediaRecorder = null
-
-            _isPaused.value = true
-            updateNotification(_durationSec.value)
-            InterpreterWidgetProvider.updateWidgetState(this)
-            Log.d(TAG, "Recording paused, segment finalized: ${currentSegmentFile?.absolutePath}")
-
-            // Publish segment info
-            currentSegmentFile?.let { file ->
-                val sessId = _meetingSessionId.value.orEmpty()
-                _latestSegment.value = SegmentInfo(sessId, file.absolutePath, segmentDurationSec)
-            }
-
-            segmentDurationSec = 0
-            segmentIndex++
-        } catch (e: Exception) {
-            Log.e(TAG, "Failed to pause recording", e)
-        }
+        _isPaused.value = true
+        updateNotification(_durationSec.value)
+        InterpreterWidgetProvider.updateWidgetState(this)
+        Log.d(TAG, "Recording paused.")
     }
 
     private fun resumeRecording() {
         if (!_isRecording.value || !_isPaused.value) return
-        try {
-            val sessionId = _meetingSessionId.value ?: return
-            val cacheDir = externalCacheDir ?: cacheDir
-            val outputFile = File(cacheDir, "${sessionId}_part_${segmentIndex}.m4a")
-            currentSegmentFile = outputFile
-            segmentDurationSec = 0
-
-            mediaRecorder = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-                MediaRecorder(this)
-            } else {
-                @Suppress("DEPRECATION")
-                MediaRecorder()
-            }.apply {
-                setAudioSource(MediaRecorder.AudioSource.MIC)
-                setOutputFormat(MediaRecorder.OutputFormat.MPEG_4)
-                setAudioEncoder(MediaRecorder.AudioEncoder.AAC)
-                setAudioSamplingRate(16000)
-                setAudioChannels(1)
-                setAudioEncodingBitRate(32000)
-                setOutputFile(outputFile.absolutePath)
-                prepare()
-                start()
-            }
-
-            _isPaused.value = false
-            updateNotification(_durationSec.value)
-            InterpreterWidgetProvider.updateWidgetState(this)
-            Log.d(TAG, "Recording resumed segment $segmentIndex: ${outputFile.absolutePath}")
-        } catch (e: Exception) {
-            Log.e(TAG, "Failed to resume recording", e)
-        }
+        _isPaused.value = false
+        segmentDurationSec = 0
+        updateNotification(_durationSec.value)
+        InterpreterWidgetProvider.updateWidgetState(this)
+        Log.d(TAG, "Recording resumed.")
     }
 
     private fun stopRecording() {
         if (!_isRecording.value) return
         Log.d(TAG, "Stopping recording")
-        val wasPaused = _isPaused.value
         _isRecording.value = false
         _isPaused.value = false
+        isRecordingAudio = false
         serviceJob?.cancel()
         InterpreterWidgetProvider.updateWidgetState(this)
 
         try {
-            if (!wasPaused) {
-                mediaRecorder?.apply {
-                    stop()
-                    release()
-                }
-                
-                // Publish final segment
-                currentSegmentFile?.let { file ->
-                    val sessId = _meetingSessionId.value.orEmpty()
-                    _latestSegment.value = SegmentInfo(sessId, file.absolutePath, segmentDurationSec)
-                }
-            }
+            recordingThread?.join(1000)
         } catch (e: Exception) {
-            Log.e(TAG, "Error stopping MediaRecorder", e)
-        } finally {
-            mediaRecorder = null
+            Log.e(TAG, "Error joining recording thread", e)
         }
 
-        // Release WakeLock
         wakeLock?.apply { if (isHeld) release() }
         wakeLock = null
 

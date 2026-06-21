@@ -91,4 +91,63 @@ object LocalAsrClient {
             throw e
         }
     }
+
+    data class AsrResponse(val text: String, val speaker: String?)
+
+    fun transcribeSegment(
+        baseUrl: String,
+        audioBytes: ByteArray,
+        filename: String = "audio.wav",
+        mimeType: String = "audio/wav",
+        model: String = "medium",
+        language: String? = null,
+        task: String = "transcribe",
+        sessionId: String? = null,
+        segmentIndex: Int? = null
+    ): AsrResponse {
+        val normalizedBase = baseUrl.trimEnd('/')
+        val endpoint = if (normalizedBase.endsWith("/v1")) {
+            "$normalizedBase/audio/transcriptions"
+        } else {
+            "$normalizedBase/v1/audio/transcriptions"
+        }
+
+        Log.d(TAG, "Transcribing segment index=$segmentIndex for session=$sessionId via local server: $endpoint")
+
+        val fileBody = audioBytes.toRequestBody(mimeType.toMediaType())
+        val formBuilder = MultipartBody.Builder()
+            .setType(MultipartBody.FORM)
+            .addFormDataPart("model", model)
+            .addFormDataPart("task", task)
+            .addFormDataPart("file", filename, fileBody)
+
+        if (!language.isNullOrBlank() && language.lowercase() != "auto") {
+            formBuilder.addFormDataPart("language", language)
+        }
+        if (sessionId != null) {
+            formBuilder.addFormDataPart("session_id", sessionId)
+        }
+        if (segmentIndex != null) {
+            formBuilder.addFormDataPart("segment_index", segmentIndex.toString())
+        }
+
+        val request = Request.Builder()
+            .url(endpoint)
+            .post(formBuilder.build())
+            .build()
+
+        return httpClient.newCall(request).execute().use { resp ->
+            val body = resp.body?.string().orEmpty()
+            if (!resp.isSuccessful) {
+                Log.e(TAG, "Local ASR segment error ${resp.code}: $body")
+                throw IllegalStateException("Local ASR error ${resp.code}: $body")
+            }
+            val json = JSONObject(body)
+            val text = json.optString("text", "").trim()
+            val speaker = if (json.has("speaker") && !json.isNull("speaker")) json.getString("speaker") else null
+            Log.d(TAG, "Local ASR segment result: speaker=$speaker, text=$text")
+            AsrResponse(text, speaker)
+        }
+    }
 }
+

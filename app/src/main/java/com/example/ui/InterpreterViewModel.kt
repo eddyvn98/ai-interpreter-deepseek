@@ -22,6 +22,9 @@ import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.stateIn
+import kotlinx.coroutines.flow.flatMapLatest
+import kotlinx.coroutines.flow.flowOf
+
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.CancellationException
 import java.util.ArrayDeque
@@ -262,6 +265,17 @@ class InterpreterViewModel(application: Application) : AndroidViewModel(applicat
 
     internal val _meetingCompletionMessage = MutableStateFlow<String?>(null)
     val meetingCompletionMessage: StateFlow<String?> = _meetingCompletionMessage.asStateFlow()
+
+    @OptIn(kotlinx.coroutines.ExperimentalCoroutinesApi::class)
+    val currentMeetingSegments: StateFlow<List<com.example.data.database.MeetingAudioSegment>> = 
+        MeetingRecordService.meetingSessionId.flatMapLatest { sessionId ->
+            if (sessionId != null) {
+                repository.getSegmentsBySessionId(sessionId)
+            } else {
+                kotlinx.coroutines.flow.flowOf(emptyList())
+            }
+        }.stateIn(viewModelScope, SharingStarted.Lazily, emptyList())
+
 
     internal fun addCost(amountUsd: Double) {
         val current = prefs.getFloat("total_cost_usd", 0f)

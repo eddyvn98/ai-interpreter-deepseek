@@ -57,6 +57,9 @@ def translate_vi_to_en(text: str) -> str:
         print(f"[Translation] Error translating text '{text}': {e}")
         return ""
 
+import librosa
+import numpy as np
+
 active_windows_connections = []
 
 async def broadcast_to_windows(text: str):
@@ -74,7 +77,72 @@ async def broadcast_to_windows(text: str):
         if conn in active_windows_connections:
             active_windows_connections.remove(conn)
 
+# Speaker Diarization Cache & Utils
+speaker_sessions_cache = {}
+
+def get_speaker_embedding(audio_path: str) -> np.ndarray:
+    y, sr = librosa.load(audio_path, sr=16000)
+    # Extract 20 MFCC coefficients
+    mfcc = librosa.feature.mfcc(y=y, sr=sr, n_mfcc=20)
+    mfcc_mean = np.mean(mfcc, axis=1)
+    mfcc_std = np.std(mfcc, axis=1)
+    # Form a 40-dimensional feature vector
+    embedding = np.concatenate((mfcc_mean, mfcc_std))
+    norm = np.linalg.norm(embedding)
+    if norm > 0:
+        embedding = embedding / norm
+    return embedding
+
+def identify_speaker(session_id: str, audio_path: str) -> str:
+    if not session_id:
+        return "Speaker Unknown"
+        
+    try:
+        new_emb = get_speaker_embedding(audio_path)
+    except Exception as e:
+        print(f"[Speaker ID] Error extracting embedding: {e}")
+        return "Speaker Unknown"
+        
+    if session_id not in speaker_sessions_cache:
+        speaker_sessions_cache[session_id] = []
+        
+    sessions = speaker_sessions_cache[session_id]
+    
+    best_sim = -1.0
+    best_label = None
+    best_index = -1
+    
+    for idx, spk in enumerate(sessions):
+        # Cosine similarity
+        sim = np.dot(new_emb, spk["embedding"]) / (np.linalg.norm(new_emb) * np.linalg.norm(spk["embedding"]) + 1e-9)
+        if sim > best_sim:
+            best_sim = sim
+            best_label = spk["label"]
+            best_index = idx
+            
+    threshold = 0.75 # Threshold for speaker verification
+    
+    if best_sim >= threshold:
+        # Match found, update embedding with moving average
+        old_emb = sessions[best_index]["embedding"]
+        sessions[best_index]["embedding"] = old_emb * 0.8 + new_emb * 0.2
+        norm = np.linalg.norm(sessions[best_index]["embedding"])
+        if norm > 0:
+            sessions[best_index]["embedding"] /= norm
+        print(f"[Speaker ID] Match: {best_label} (Sim: {best_sim:.4f})")
+        return best_label
+    else:
+        # New speaker detected
+        new_label = f"Speaker {len(sessions) + 1}"
+        sessions.append({
+            "label": new_label,
+            "embedding": new_emb
+        })
+        print(f"[Speaker ID] New speaker: {new_label} (Max Sim: {best_sim:.4f})")
+        return new_label
+
 app = FastAPI()
+
 
 app.add_middleware(
     CORSMiddleware,
@@ -253,6 +321,8 @@ async def transcribe(
     prompt: str = Form(None),
     temperature: float = Form(0.0),
     task: str = Form("transcribe"),
+    session_id: str = Form(None),
+    segment_index: int = Form(None),
 ):
     suffix = os.path.splitext(file.filename)[1] if file.filename else ".wav"
     with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
@@ -272,13 +342,19 @@ async def transcribe(
         text = extract_text(result)
         print(f"[{task}] {text}")
         
+        # Identify speaker if session_id is provided
+        speaker = None
+        if text.strip() and session_id:
+            speaker = identify_speaker(session_id, tmp_path)
+            print(f"[ASR Segment] session={session_id}, index={segment_index}, speaker={speaker}, text={text}")
+            
         # Auto translate and broadcast to Windows clients
         if text.strip():
             en_text = translate_vi_to_en(text)
             if en_text:
                 asyncio.create_task(broadcast_to_windows(en_text))
                 
-        return {"text": text}
+        return {"text": text, "speaker": speaker}
     except Exception as e:
         print(f"Transcription error: {e}")
         return JSONResponse(status_code=500, content={"error": str(e)})
@@ -288,6 +364,7 @@ async def transcribe(
                 os.remove(tmp_path)
             except Exception:
                 pass
+
 
 
 @app.websocket("/v1/audio/stream")

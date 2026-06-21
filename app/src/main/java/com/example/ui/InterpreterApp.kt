@@ -134,6 +134,8 @@ fun InterpreterApp(viewModel: InterpreterViewModel) {
     val meetingTranscript by viewModel.meetingTranscript.collectAsState()
     val meetingRawTranscript by viewModel.meetingRawTranscript.collectAsState()
     val meetingCompletionMessage by viewModel.meetingCompletionMessage.collectAsState()
+    val currentMeetingSegments by viewModel.currentMeetingSegments.collectAsState()
+
 
     fun getLanguageLabel(code: String): String {
         return when (code.uppercase()) {
@@ -572,6 +574,7 @@ fun InterpreterApp(viewModel: InterpreterViewModel) {
                             rawTranscript = meetingRawTranscript,
                             micStatus = micStatus,
                             records = records,
+                            segments = currentMeetingSegments,
                             hasPermission = hasRecordPermission,
                             onRequestPermission = { requestMicPermission(PendingMicAction.TOGGLE_SESSION) },
                             onStartRecording = { viewModel.startMeetingRecording() },
@@ -579,11 +582,13 @@ fun InterpreterApp(viewModel: InterpreterViewModel) {
                             onResumeRecording = { viewModel.resumeMeetingRecording() },
                             onStopRecording = { viewModel.stopMeetingRecording() },
                             onDeleteRecord = { id -> viewModel.deleteHistoryRecord(id) },
+                            onRetrySegments = { viewModel.retryFailedSegments(MeetingRecordService.meetingSessionId.value.orEmpty()) },
                             modifier = Modifier.fillMaxSize(),
                             showControlButtons = false,
                             isDarkMode = isDarkMode
                         )
                     }
+
                 }
 
                 // 3. Floating Overlay Options

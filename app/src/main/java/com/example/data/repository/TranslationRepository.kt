@@ -53,4 +53,30 @@ class TranslationRepository(private val dao: TranslationDao) {
     suspend fun clearSummaries() {
         dao.clearAllSummaries()
     }
+
+    // Meeting segments repository methods
+    fun getSegmentsBySessionId(sessionId: String): Flow<List<com.example.data.database.MeetingAudioSegment>> {
+        return dao.getSegmentsBySessionId(sessionId)
+    }
+
+    suspend fun getSegmentsBySessionIdDirect(sessionId: String): List<com.example.data.database.MeetingAudioSegment> {
+        return dao.getSegmentsBySessionIdDirect(sessionId)
+    }
+
+    suspend fun insertSegment(segment: com.example.data.database.MeetingAudioSegment): Long {
+        return dao.insertSegment(segment)
+    }
+
+    suspend fun updateSegmentStatus(id: Long, status: String, speakerLabel: String?, transcribedText: String?) {
+        dao.updateSegmentStatus(id, status, speakerLabel, transcribedText)
+    }
+
+    suspend fun getUnfinishedSegments(): List<com.example.data.database.MeetingAudioSegment> {
+        return dao.getUnfinishedSegments()
+    }
+
+    suspend fun deleteSegmentsBySession(sessionId: String) {
+        dao.deleteSegmentsBySession(sessionId)
+    }
 }
+
