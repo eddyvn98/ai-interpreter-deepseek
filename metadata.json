@@ -1,0 +1,8 @@
+{
+  "name": "AI Interpreter",
+  "description": "AI-powered speech interpreter and translator with natural synthesized dialog speaker sound outputs.",
+  "requestFramePermissions": [],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
