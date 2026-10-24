@@ -12,7 +12,7 @@ Start-Process -FilePath "$BaseDir\scripts\venv\Scripts\python.exe" `
 
 Write-Output "Starting Cloudflare Tunnel in the background..."
 Start-Process -FilePath "C:\Program Files (x86)\cloudflared\cloudflared.exe" `
-              -ArgumentList "tunnel run --url http://localhost:8000 dich-vivutrade" `
+              -ArgumentList "--config `"$BaseDir\scripts\blank_config.yml`" tunnel run --url http://localhost:8000 dich-vivutrade" `
               -WorkingDirectory $BaseDir `
               -WindowStyle Hidden `
               -RedirectStandardOutput "$BaseDir\scripts\tunnel_dich.log" `

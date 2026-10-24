@@ -22,6 +22,9 @@ import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.stateIn
+import kotlinx.coroutines.flow.flatMapLatest
+import kotlinx.coroutines.flow.flowOf
+
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.CancellationException
 import java.util.ArrayDeque
@@ -170,6 +173,9 @@ class InterpreterViewModel(application: Application) : AndroidViewModel(applicat
     internal val _isGeneratingVoice = MutableStateFlow(false)
     val isGeneratingVoice: StateFlow<Boolean> = _isGeneratingVoice.asStateFlow()
 
+    internal val _isGeneratingCloneVoice = MutableStateFlow(false)
+    val isGeneratingCloneVoice: StateFlow<Boolean> = _isGeneratingCloneVoice.asStateFlow()
+
     internal val _isSpeaking = MutableStateFlow(false)
     val isSpeaking: StateFlow<Boolean> = _isSpeaking.asStateFlow()
 
@@ -262,6 +268,17 @@ class InterpreterViewModel(application: Application) : AndroidViewModel(applicat
 
     internal val _meetingCompletionMessage = MutableStateFlow<String?>(null)
     val meetingCompletionMessage: StateFlow<String?> = _meetingCompletionMessage.asStateFlow()
+
+    @OptIn(kotlinx.coroutines.ExperimentalCoroutinesApi::class)
+    val currentMeetingSegments: StateFlow<List<com.example.data.database.MeetingAudioSegment>> = 
+        MeetingRecordService.meetingSessionId.flatMapLatest { sessionId ->
+            if (sessionId != null) {
+                repository.getSegmentsBySessionId(sessionId)
+            } else {
+                kotlinx.coroutines.flow.flowOf(emptyList())
+            }
+        }.stateIn(viewModelScope, SharingStarted.Lazily, emptyList())
+
 
     internal fun addCost(amountUsd: Double) {
         val current = prefs.getFloat("total_cost_usd", 0f)
@@ -365,6 +382,8 @@ class InterpreterViewModel(application: Application) : AndroidViewModel(applicat
                 }
             }
         }
+
+        syncModeWithLanguages()
 
         Log.d(TAG, "ViewModel initialized – realtime Google STT mode")
     }
@@ -500,11 +519,25 @@ class InterpreterViewModel(application: Application) : AndroidViewModel(applicat
     fun setSourceLang(lang: String) {
         prefs.edit().putString("source_lang", lang).apply()
         _sourceLang.value = lang
+        syncModeWithLanguages()
     }
 
     fun setTargetLang(lang: String) {
         prefs.edit().putString("target_lang", lang).apply()
         _targetLang.value = lang
+        syncModeWithLanguages()
+    }
+
+    private fun syncModeWithLanguages() {
+        val src = _sourceLang.value.uppercase()
+        val tgt = _targetLang.value.uppercase()
+        if (_currentMode.value != TranslateMode.MEETING_RECORD) {
+            if (src == "VI" && tgt == "EN") {
+                _currentMode.value = TranslateMode.VI_TO_EN
+            } else {
+                _currentMode.value = TranslateMode.EN_TO_VI
+            }
+        }
     }
 
 

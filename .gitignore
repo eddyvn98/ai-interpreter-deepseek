@@ -24,3 +24,11 @@ debug.keystore
 *.xml
 scripts/venv/
 scripts/__pycache__/
+
+scratch/
+scripts/MOSS-TTS-Nano/
+scripts/piper_models/
+scripts/*.wav
+scripts/*.bak
+scripts/blank_config.yml
+

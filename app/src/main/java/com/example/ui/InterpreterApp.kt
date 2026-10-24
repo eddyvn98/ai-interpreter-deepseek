@@ -96,6 +96,7 @@ fun InterpreterApp(viewModel: InterpreterViewModel) {
     val isListening by viewModel.isListening.collectAsState()
     val isPaused by viewModel.isPaused.collectAsState()
     val isGeneratingVoice by viewModel.isGeneratingVoice.collectAsState()
+    val isGeneratingCloneVoice by viewModel.isGeneratingCloneVoice.collectAsState()
     val isSummarizing by viewModel.isSummarizing.collectAsState()
     val isSummaryPaused by viewModel.isSummaryPaused.collectAsState()
     val isSpeaking by viewModel.isSpeaking.collectAsState()
@@ -134,6 +135,8 @@ fun InterpreterApp(viewModel: InterpreterViewModel) {
     val meetingTranscript by viewModel.meetingTranscript.collectAsState()
     val meetingRawTranscript by viewModel.meetingRawTranscript.collectAsState()
     val meetingCompletionMessage by viewModel.meetingCompletionMessage.collectAsState()
+    val currentMeetingSegments by viewModel.currentMeetingSegments.collectAsState()
+
 
     fun getLanguageLabel(code: String): String {
         return when (code.uppercase()) {
@@ -572,6 +575,7 @@ fun InterpreterApp(viewModel: InterpreterViewModel) {
                             rawTranscript = meetingRawTranscript,
                             micStatus = micStatus,
                             records = records,
+                            segments = currentMeetingSegments,
                             hasPermission = hasRecordPermission,
                             onRequestPermission = { requestMicPermission(PendingMicAction.TOGGLE_SESSION) },
                             onStartRecording = { viewModel.startMeetingRecording() },
@@ -579,11 +583,13 @@ fun InterpreterApp(viewModel: InterpreterViewModel) {
                             onResumeRecording = { viewModel.resumeMeetingRecording() },
                             onStopRecording = { viewModel.stopMeetingRecording() },
                             onDeleteRecord = { id -> viewModel.deleteHistoryRecord(id) },
+                            onRetrySegments = { viewModel.retryFailedSegments(MeetingRecordService.meetingSessionId.value.orEmpty()) },
                             modifier = Modifier.fillMaxSize(),
                             showControlButtons = false,
                             isDarkMode = isDarkMode
                         )
                     }
+
                 }
 
                 // 3. Floating Overlay Options
@@ -742,6 +748,34 @@ fun InterpreterApp(viewModel: InterpreterViewModel) {
                             tint = if (isTtsEnabled) Color.White else themeTextColor,
                             modifier = Modifier.size(20.dp)
                         )
+                    }
+
+                    if (currentMode == TranslateMode.VI_TO_EN) {
+                        Spacer(modifier = Modifier.width(12.dp))
+                        IconButton(
+                            onClick = { viewModel.playCloneTtsForLastTranslation() },
+                            modifier = Modifier
+                                .size(48.dp)
+                                .clip(CircleShape)
+                                .background(if (isGeneratingCloneVoice) themePillColor else MinimalAccentBrown)
+                                .border(1.dp, themeBorderColor, CircleShape),
+                            enabled = !isGeneratingCloneVoice
+                        ) {
+                            if (isGeneratingCloneVoice) {
+                                androidx.compose.material3.CircularProgressIndicator(
+                                    modifier = Modifier.size(20.dp),
+                                    color = themeTextColor,
+                                    strokeWidth = 2.dp
+                                )
+                            } else {
+                                Text(
+                                    text = "AI",
+                                    color = Color.White,
+                                    fontSize = 14.sp,
+                                    fontWeight = FontWeight.Bold
+                                )
+                            }
+                        }
                     }
                 }
             }
