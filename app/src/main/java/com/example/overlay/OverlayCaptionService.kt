@@ -129,6 +129,7 @@ class OverlayCaptionService : Service() {
 
         const val ACTION_VI_TO_EN_MIC = "com.example.overlay.VI_TO_EN_MIC"
         const val ACTION_VI_TO_EN_REPLAY = "com.example.overlay.VI_TO_EN_REPLAY"
+        const val ACTION_VI_TO_EN_CLONE_REPLAY = "com.example.overlay.ACTION_VI_TO_EN_CLONE_REPLAY"
 
         val _micLevelFlow = MutableStateFlow(0f)
         val micLevelFlow = _micLevelFlow.asStateFlow()
@@ -177,6 +178,21 @@ class OverlayCaptionService : Service() {
 
     override fun onBind(intent: Intent?): IBinder? = null
 
+    private fun vibrate(durationMs: Long) {
+        val vibrator = getSystemService(Context.VIBRATOR_SERVICE) as? android.os.Vibrator
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            val vibratorManager = getSystemService(Context.VIBRATOR_MANAGER_SERVICE) as? android.os.VibratorManager
+            val vib = vibratorManager?.defaultVibrator ?: vibrator
+            vib?.vibrate(android.os.VibrationEffect.createOneShot(durationMs, android.os.VibrationEffect.DEFAULT_AMPLITUDE))
+        } else if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            @Suppress("DEPRECATION")
+            vibrator?.vibrate(android.os.VibrationEffect.createOneShot(durationMs, android.os.VibrationEffect.DEFAULT_AMPLITUDE))
+        } else {
+            @Suppress("DEPRECATION")
+            vibrator?.vibrate(durationMs)
+        }
+    }
+
     override fun onCreate() {
         super.onCreate()
         startForeground(NOTIFICATION_ID, buildNotification("Phụ đề nổi đang chạy"))
@@ -216,6 +232,9 @@ class OverlayCaptionService : Service() {
             }
             ACTION_VI_TO_EN_REPLAY -> {
                 replayLastTranslation()
+            }
+            ACTION_VI_TO_EN_CLONE_REPLAY -> {
+                replayLastTranslationWithClone()
             }
         }
         return START_STICKY
@@ -292,55 +311,196 @@ class OverlayCaptionService : Service() {
             }
         }
         layoutParams = params
-        view.alpha = 1.0f
+        
+        val prefs = getSharedPreferences("usage_costs", Context.MODE_PRIVATE)
+        overlayDisplayMode = prefs.getInt("overlay_display_mode", DISPLAY_MODE_BOTH)
+        view.alpha = if (isPausedFlow.value) 0.5f else 1.0f
 
         windowManager?.addView(view, params)
-        applyStyle(overlayAlpha, overlayFontScale)
+        applyStyle(overlayAlpha, overlayFontScale, overlayDisplayMode)
     }
 
     private fun setupOverlayInteractions(view: View, mode: OverlayMode) {
         if (mode == OverlayMode.EN_TO_VI) {
+            tvOriginal = view.findViewById(R.id.tv_original)
+            tvTranslated = view.findViewById(R.id.tv_translated)
+            tvOverlayStatus = null
+
+            val handler = android.os.Handler(android.os.Looper.getMainLooper())
+            var runnable1s: Runnable? = null
+            var runnable2s: Runnable? = null
+
             view.setOnTouchListener(object : View.OnTouchListener {
                 private var initialY = 0
                 private var initialTouchY = 0f
+                private var initialTouchX = 0f
+                private var isLongPress1sTriggered = false
+                private var isLongPress2sTriggered = false
+                private var canDrag = false
+                private val touchSlop = 10f * resources.displayMetrics.density
+
+                private var trashView: View? = null
+                private var isHoveredOnTrash = false
+
                 override fun onTouch(v: View, event: MotionEvent): Boolean {
                     val lp = layoutParams ?: return false
                     when (event.action) {
                         MotionEvent.ACTION_DOWN -> {
                             initialY = lp.y
                             initialTouchY = event.rawY
+                            initialTouchX = event.rawX
+                            isLongPress1sTriggered = false
+                            isLongPress2sTriggered = false
+                            canDrag = false
+                            isHoveredOnTrash = false
+
+                            runnable1s = Runnable {
+                                if (!isLongPress1sTriggered && !canDrag) {
+                                    isLongPress1sTriggered = true
+                                    vibrate(50)
+                                    if (isPausedFlow.value) {
+                                        resumeAsrPipeline()
+                                        android.widget.Toast.makeText(applicationContext, "Phụ đề: Đang nghe", android.widget.Toast.LENGTH_SHORT).show()
+                                    } else {
+                                        pauseAsrPipeline()
+                                        android.widget.Toast.makeText(applicationContext, "Phụ đề: Đã tạm dừng", android.widget.Toast.LENGTH_SHORT).show()
+                                    }
+                                }
+                            }
+                            handler.postDelayed(runnable1s!!, 1000)
+
+                            runnable2s = Runnable {
+                                if (!isLongPress2sTriggered) {
+                                    isLongPress2sTriggered = true
+                                    canDrag = true
+                                    vibrate(40)
+                                    handler.postDelayed({ vibrate(40) }, 100)
+                                    showTrashView()
+                                }
+                            }
+                            handler.postDelayed(runnable2s!!, 2000)
+
                             return true
                         }
                         MotionEvent.ACTION_MOVE -> {
-                            lp.y = initialY + (event.rawY - initialTouchY).toInt()
-                            windowManager?.updateViewLayout(overlayRoot, lp)
+                            val deltaY = event.rawY - initialTouchY
+                            val deltaX = event.rawX - initialTouchX
+
+                            if (!canDrag) {
+                                if (Math.abs(deltaY) > touchSlop || Math.abs(deltaX) > touchSlop) {
+                                    runnable1s?.let { handler.removeCallbacks(it) }
+                                    runnable2s?.let { handler.removeCallbacks(it) }
+                                }
+                            } else {
+                                lp.y = (initialY + deltaY).toInt()
+                                windowManager?.updateViewLayout(overlayRoot, lp)
+                                checkTrashHover(event.rawX, event.rawY)
+                            }
                             return true
                         }
                         MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
-                            val prefs = getSharedPreferences("usage_costs", Context.MODE_PRIVATE)
-                            prefs.edit().putInt("overlay_pos_y", lp.y).apply()
+                            runnable1s?.let { handler.removeCallbacks(it) }
+                            runnable2s?.let { handler.removeCallbacks(it) }
+
+                            if (canDrag) {
+                                removeTrashView()
+                                if (isHoveredOnTrash) {
+                                    stopSelf()
+                                } else {
+                                    val prefs = getSharedPreferences("usage_costs", Context.MODE_PRIVATE)
+                                    prefs.edit().putInt("overlay_pos_y", lp.y).apply()
+                                }
+                            } else {
+                                if (!isLongPress1sTriggered && !isLongPress2sTriggered) {
+                                    val nextMode = when (overlayDisplayMode) {
+                                        DISPLAY_MODE_BOTH -> DISPLAY_MODE_EN
+                                        DISPLAY_MODE_EN -> DISPLAY_MODE_VI
+                                        else -> DISPLAY_MODE_BOTH
+                                    }
+                                    val msg = when (nextMode) {
+                                        DISPLAY_MODE_BOTH -> "Hiển thị: Song ngữ"
+                                        DISPLAY_MODE_EN -> "Hiển thị: Tiếng Anh"
+                                        DISPLAY_MODE_VI -> "Hiển thị: Tiếng Việt"
+                                        else -> ""
+                                    }
+                                    android.widget.Toast.makeText(applicationContext, msg, android.widget.Toast.LENGTH_SHORT).show()
+                                    
+                                    val prefs = getSharedPreferences("usage_costs", Context.MODE_PRIVATE)
+                                    prefs.edit().putInt("overlay_display_mode", nextMode).apply()
+                                    
+                                    applyStyle(overlayAlpha, overlayFontScale, nextMode)
+                                }
+                            }
                             return true
                         }
                     }
                     return false
                 }
+
+                private fun showTrashView() {
+                    if (trashView != null) return
+                    val inflater = LayoutInflater.from(this@OverlayCaptionService)
+                    trashView = inflater.inflate(R.layout.overlay_trash, null)
+                    
+                    val density = resources.displayMetrics.density
+                    val trashParams = WindowManager.LayoutParams(
+                        WindowManager.LayoutParams.WRAP_CONTENT,
+                        WindowManager.LayoutParams.WRAP_CONTENT,
+                        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY else WindowManager.LayoutParams.TYPE_PHONE,
+                        WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
+                        PixelFormat.TRANSLUCENT
+                    ).apply {
+                        gravity = Gravity.BOTTOM or Gravity.CENTER_HORIZONTAL
+                        y = (80 * density).toInt()
+                    }
+                    windowManager?.addView(trashView, trashParams)
+                }
+
+                private fun removeTrashView() {
+                    trashView?.let {
+                        runCatching { windowManager?.removeView(it) }
+                    }
+                    trashView = null
+                    isHoveredOnTrash = false
+                }
+
+                private fun checkTrashHover(rawX: Float, rawY: Float) {
+                    val view = trashView ?: return
+                    val screenWidth = resources.displayMetrics.widthPixels
+                    val screenHeight = resources.displayMetrics.heightPixels
+                    val density = resources.displayMetrics.density
+
+                    val trashCenterX = screenWidth / 2f
+                    val trashCenterY = screenHeight - (130f * density)
+
+                    val distance = Math.hypot((rawX - trashCenterX).toDouble(), (rawY - trashCenterY).toDouble())
+                    val threshold = 90f * density
+
+                    val trashCircle = view.findViewById<View>(R.id.trash_circle)
+                    val tvLabel = view.findViewById<TextView>(R.id.tv_trash_label)
+
+                    if (distance < threshold) {
+                        if (!isHoveredOnTrash) {
+                            isHoveredOnTrash = true
+                            vibrate(20)
+                            trashCircle?.scaleX = 1.25f
+                            trashCircle?.scaleY = 1.25f
+                            trashCircle?.background?.mutate()?.setTint(android.graphics.Color.parseColor("#E53935"))
+                            tvLabel?.text = "Thả ra để tắt phụ đề"
+                            tvLabel?.setTextColor(android.graphics.Color.parseColor("#FF8A80"))
+                        }
+                    } else {
+                        if (isHoveredOnTrash) {
+                            isHoveredOnTrash = false
+                            trashCircle?.scaleX = 1.0f
+                            trashCircle?.scaleY = 1.0f
+                            trashCircle?.background?.mutate()?.setTint(android.graphics.Color.parseColor("#B32C2C2C"))
+                            tvLabel?.text = "Kéo vào đây để tắt"
+                            tvLabel?.setTextColor(android.graphics.Color.parseColor("#CCFFFFFF"))
+                        }
+                    }
+                }
             })
-        }
-
-        if (mode == OverlayMode.EN_TO_VI) {
-            tvOriginal = view.findViewById(R.id.tv_original)
-            tvTranslated = view.findViewById(R.id.tv_translated)
-            tvOverlayStatus = view.findViewById(R.id.tv_overlay_status)
-
-            view.findViewById<View>(R.id.btn_pause).setOnClickListener {
-                pauseAsrPipeline()
-            }
-            view.findViewById<View>(R.id.btn_resume).setOnClickListener {
-                resumeAsrPipeline()
-            }
-            view.findViewById<View>(R.id.btn_exit).setOnClickListener {
-                stopSelf()
-            }
         } else if (mode == OverlayMode.VI_TO_EN) {
             tvMicStatus = view.findViewById(R.id.tv_mic_status)
             tvMicLevel = view.findViewById(R.id.tv_mic_level)
@@ -767,12 +927,14 @@ class OverlayCaptionService : Service() {
         isPausedFlow.value = true
         tvOverlayStatus?.text = "Phụ đề: Đã tạm dừng"
         InterpreterWidgetProvider.updateWidgetState(this)
+        overlayRoot?.alpha = 0.5f
     }
 
     private fun resumeAsrPipeline() {
         isPausedFlow.value = false
         tvOverlayStatus?.text = "Phụ đề: Đang nghe"
         InterpreterWidgetProvider.updateWidgetState(this)
+        overlayRoot?.alpha = 1.0f
     }
 
     // ─── Mic Mode ViToEn Pipeline ─────────────────────────────────────────────
@@ -1015,6 +1177,31 @@ class OverlayCaptionService : Service() {
         if (text.isBlank() || micState.value == MicState.RECORDING || micState.value == MicState.PROCESSING) return
         renderViToEnTranslatedUi(status = "Phát lại...", speaking = true)
         speakWithAndroidTts(text)
+    }
+
+    private fun replayLastTranslationWithClone() {
+        val text = lastEnglishTranslation.ifBlank { _currentTranslatedFlow.value }
+        if (text.isBlank() || micState.value == MicState.RECORDING || micState.value == MicState.PROCESSING) return
+        renderViToEnTranslatedUi(status = "Đang tạo giọng...", speaking = true)
+        
+        serviceScope.launch {
+            try {
+                val asrBaseUrl = com.example.BuildConfig.ASR_BASE_URL.trim()
+                val base64Audio = withContext(Dispatchers.IO) {
+                    LocalAsrClient.synthesizeCloneVoice(asrBaseUrl, text)
+                }
+                if (base64Audio.isNotEmpty()) {
+                    renderViToEnTranslatedUi(status = "Phát giọng clone...", speaking = true)
+                    playAudioFromBase64(base64Audio)
+                } else {
+                    throw IllegalStateException("Empty audio returned from server")
+                }
+            } catch (e: Exception) {
+                Log.e(TAG, "Clone TTS synthesis failed, falling back to local TTS", e)
+                renderViToEnTranslatedUi(status = "Lỗi clone, dùng TTS...", speaking = true)
+                speakWithAndroidTts(text)
+            }
+        }
     }
 
     private fun stopPlayback() {

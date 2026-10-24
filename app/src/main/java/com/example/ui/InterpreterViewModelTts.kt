@@ -3,6 +3,10 @@ package com.example.ui
 import android.util.Log
 import kotlinx.coroutines.launch
 import java.util.Locale
+import com.example.data.api.LocalAsrClient
+import com.example.BuildConfig
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
 
 private const val TAG = "InterpreterVMTts"
 
@@ -51,4 +55,43 @@ internal fun InterpreterViewModel.speakWithAndroidTts(text: String) {
 internal fun InterpreterViewModel.speakWithAndroidTtsVi(text: String) {
     Log.d(TAG, "speakWithAndroidTtsVi: enqueue at ${System.currentTimeMillis()} textLen=${text.length}")
     enqueueSpeech(text, Locale("vi", "VN"), "tts_vi")
+}
+
+internal fun InterpreterViewModel.playCloneTtsForLastTranslation() {
+    val text = currentTranslatedText.value.ifBlank {
+        val currentId = currentSessionId.value
+        translationRecords.value
+            .filter { it.sessionId == currentId }
+            .sortedBy { it.timestamp }
+            .lastOrNull()?.translatedText
+    }.orEmpty().trim()
+    
+    if (text.isBlank()) return
+    generateAndPlayCloneSpeech(text)
+}
+
+internal fun InterpreterViewModel.generateAndPlayCloneSpeech(text: String) {
+    processingScope.launch {
+        try {
+            _isGeneratingCloneVoice.value = true
+            _isSpeaking.value = true
+            
+            val asrBaseUrl = BuildConfig.ASR_BASE_URL.trim()
+            val base64Audio = withContext(Dispatchers.IO) {
+                LocalAsrClient.synthesizeCloneVoice(asrBaseUrl, text)
+            }
+            
+            if (base64Audio.isNotEmpty()) {
+                playAudioFromBase64(base64Audio)
+            } else {
+                throw IllegalStateException("Empty audio returned from server")
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "Clone TTS synthesis failed, falling back to local TTS", e)
+            _errorMessage.value = "Lỗi phát giọng clone: ${e.localizedMessage}"
+            speakWithAndroidTts(text)
+        } finally {
+            _isGeneratingCloneVoice.value = false
+        }
+    }
 }

@@ -96,6 +96,7 @@ fun InterpreterApp(viewModel: InterpreterViewModel) {
     val isListening by viewModel.isListening.collectAsState()
     val isPaused by viewModel.isPaused.collectAsState()
     val isGeneratingVoice by viewModel.isGeneratingVoice.collectAsState()
+    val isGeneratingCloneVoice by viewModel.isGeneratingCloneVoice.collectAsState()
     val isSummarizing by viewModel.isSummarizing.collectAsState()
     val isSummaryPaused by viewModel.isSummaryPaused.collectAsState()
     val isSpeaking by viewModel.isSpeaking.collectAsState()
@@ -747,6 +748,34 @@ fun InterpreterApp(viewModel: InterpreterViewModel) {
                             tint = if (isTtsEnabled) Color.White else themeTextColor,
                             modifier = Modifier.size(20.dp)
                         )
+                    }
+
+                    if (currentMode == TranslateMode.VI_TO_EN) {
+                        Spacer(modifier = Modifier.width(12.dp))
+                        IconButton(
+                            onClick = { viewModel.playCloneTtsForLastTranslation() },
+                            modifier = Modifier
+                                .size(48.dp)
+                                .clip(CircleShape)
+                                .background(if (isGeneratingCloneVoice) themePillColor else MinimalAccentBrown)
+                                .border(1.dp, themeBorderColor, CircleShape),
+                            enabled = !isGeneratingCloneVoice
+                        ) {
+                            if (isGeneratingCloneVoice) {
+                                androidx.compose.material3.CircularProgressIndicator(
+                                    modifier = Modifier.size(20.dp),
+                                    color = themeTextColor,
+                                    strokeWidth = 2.dp
+                                )
+                            } else {
+                                Text(
+                                    text = "AI",
+                                    color = Color.White,
+                                    fontSize = 14.sp,
+                                    fontWeight = FontWeight.Bold
+                                )
+                            }
+                        }
                     }
                 }
             }

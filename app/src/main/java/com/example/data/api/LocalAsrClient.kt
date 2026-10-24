@@ -149,5 +149,45 @@ object LocalAsrClient {
             AsrResponse(text, speaker)
         }
     }
+
+    /**
+     * Synthesize English text into voice-cloned WAV audio (base64) using the local server.
+     */
+    fun synthesizeCloneVoice(
+        baseUrl: String,
+        text: String
+    ): String {
+        val normalizedBase = baseUrl.trimEnd('/')
+        val endpoint = if (normalizedBase.endsWith("/v1")) {
+            "$normalizedBase/audio/synthesize_clone"
+        } else {
+            "$normalizedBase/v1/audio/synthesize_clone"
+        }
+
+        Log.d(TAG, "Synthesizing clone voice for text length=${text.length} via local server: $endpoint")
+
+        val formBuilder = MultipartBody.Builder()
+            .setType(MultipartBody.FORM)
+            .addFormDataPart("text", text)
+
+        val request = Request.Builder()
+            .url(endpoint)
+            .post(formBuilder.build())
+            .build()
+
+        return httpClient.newCall(request).execute().use { resp ->
+            val body = resp.body?.string().orEmpty()
+            if (!resp.isSuccessful) {
+                Log.e(TAG, "Local clone synthesis server error ${resp.code}: $body")
+                throw IllegalStateException("Local TTS synthesis error ${resp.code}: $body")
+            }
+            val json = JSONObject(body)
+            if (json.optBoolean("success", false) || json.has("audio_base64")) {
+                json.getString("audio_base64")
+            } else {
+                throw IllegalStateException("API returned failure: $body")
+            }
+        }
+    }
 }
 

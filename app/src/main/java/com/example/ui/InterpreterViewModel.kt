@@ -173,6 +173,9 @@ class InterpreterViewModel(application: Application) : AndroidViewModel(applicat
     internal val _isGeneratingVoice = MutableStateFlow(false)
     val isGeneratingVoice: StateFlow<Boolean> = _isGeneratingVoice.asStateFlow()
 
+    internal val _isGeneratingCloneVoice = MutableStateFlow(false)
+    val isGeneratingCloneVoice: StateFlow<Boolean> = _isGeneratingCloneVoice.asStateFlow()
+
     internal val _isSpeaking = MutableStateFlow(false)
     val isSpeaking: StateFlow<Boolean> = _isSpeaking.asStateFlow()
 
@@ -380,6 +383,8 @@ class InterpreterViewModel(application: Application) : AndroidViewModel(applicat
             }
         }
 
+        syncModeWithLanguages()
+
         Log.d(TAG, "ViewModel initialized – realtime Google STT mode")
     }
 
@@ -514,11 +519,25 @@ class InterpreterViewModel(application: Application) : AndroidViewModel(applicat
     fun setSourceLang(lang: String) {
         prefs.edit().putString("source_lang", lang).apply()
         _sourceLang.value = lang
+        syncModeWithLanguages()
     }
 
     fun setTargetLang(lang: String) {
         prefs.edit().putString("target_lang", lang).apply()
         _targetLang.value = lang
+        syncModeWithLanguages()
+    }
+
+    private fun syncModeWithLanguages() {
+        val src = _sourceLang.value.uppercase()
+        val tgt = _targetLang.value.uppercase()
+        if (_currentMode.value != TranslateMode.MEETING_RECORD) {
+            if (src == "VI" && tgt == "EN") {
+                _currentMode.value = TranslateMode.VI_TO_EN
+            } else {
+                _currentMode.value = TranslateMode.EN_TO_VI
+            }
+        }
     }
 
 
